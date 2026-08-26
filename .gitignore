@@ -1,0 +1,16 @@
+# Build output and IDE-specific files
+target/
+nbproject/private/
+.idea/
+*.iml
+
+# Never publish local credentials or database exports
+.env
+.env.*
+*.sql.bak
+*.dump
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db

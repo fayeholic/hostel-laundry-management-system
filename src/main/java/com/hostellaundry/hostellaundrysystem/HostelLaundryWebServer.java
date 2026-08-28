@@ -60,6 +60,7 @@ public final class HostelLaundryWebServer {
             String path = exchange.getRequestURI().getPath();
             if (path.equals("/")) { serveFile(exchange, "web/index.html", "text/html; charset=utf-8"); return; }
             if (path.equals("/app.css")) { serveFile(exchange, "web/app.css", "text/css; charset=utf-8"); return; }
+            if (path.equals("/responsive.css")) { serveFile(exchange, "web/responsive.css", "text/css; charset=utf-8"); return; }
             if (path.equals("/app.js")) { serveFile(exchange, "web/app.js", "application/javascript; charset=utf-8"); return; }
             if (path.equals("/background.mp4")) { serveBinaryFile(exchange, "web/background.mp4", "video/mp4"); return; }
             if (path.equals("/laundry-room.jpg")) { serveBinaryFile(exchange, "web/laundry-room.jpg", "image/jpeg"); return; }

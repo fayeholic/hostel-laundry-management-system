@@ -196,7 +196,30 @@ public final class HostelLaundryWebServer {
     private static Map<String,String> query(HttpExchange e){Map<String,String> m=new HashMap<>();String raw=e.getRequestURI().getRawQuery();if(raw==null)return m;for(String p:raw.split("&")){String[]a=p.split("=",2);if(a.length==2)m.put(URLDecoder.decode(a[0],StandardCharsets.UTF_8),URLDecoder.decode(a[1],StandardCharsets.UTF_8));}return m;}
     private static String cookie(HttpExchange e,String key){String raw=e.getRequestHeaders().getFirst("Cookie");if(raw!=null)for(String p:raw.split(";")){String[]a=p.trim().split("=",2);if(a.length==2&&a[0].equals(key))return a[1];}return "";}
     private static void serveFile(HttpExchange e,String name,String type)throws IOException{try(InputStream in=HostelLaundryWebServer.class.getClassLoader().getResourceAsStream(name)){if(in==null){send(e,404,"text/plain","File not found");return;}send(e,200,type,new String(in.readAllBytes(),StandardCharsets.UTF_8));}}
-    private static void serveBinaryFile(HttpExchange e, String name, String type) throws IOException { try (InputStream in = HostelLaundryWebServer.class.getClassLoader().getResourceAsStream(name)) { if (in == null) { send(e, 404, "text/plain", "File not found"); return; } byte[] bytes = in.readAllBytes(); e.getResponseHeaders().set("Content-Type", type); e.getResponseHeaders().set("Cache-Control", "no-cache"); e.sendResponseHeaders(200, bytes.length); e.getResponseBody().write(bytes); e.close(); } }
+    private static void serveBinaryFile(HttpExchange e, String name, String type) throws IOException {
+        try (InputStream in = HostelLaundryWebServer.class.getClassLoader().getResourceAsStream(name)) {
+            if (in == null) { send(e, 404, "text/plain", "File not found"); return; }
+            byte[] bytes = in.readAllBytes();
+            int start = 0, end = bytes.length - 1;
+            String range = e.getRequestHeaders().getFirst("Range");
+            if (range != null && range.startsWith("bytes=")) {
+                String[] parts = range.substring(6).split("-", 2);
+                try {
+                    start = Integer.parseInt(parts[0]);
+                    if (parts.length == 2 && !parts[1].isBlank()) end = Math.min(Integer.parseInt(parts[1]), end);
+                } catch (NumberFormatException ignored) { start = 0; }
+            }
+            if (start < 0 || start >= bytes.length || end < start) { e.getResponseHeaders().set("Content-Range", "bytes */" + bytes.length); e.sendResponseHeaders(416, -1); e.close(); return; }
+            int length = end - start + 1;
+            e.getResponseHeaders().set("Content-Type", type);
+            e.getResponseHeaders().set("Accept-Ranges", "bytes");
+            e.getResponseHeaders().set("Cache-Control", "public, max-age=86400");
+            if (range != null) e.getResponseHeaders().set("Content-Range", "bytes " + start + "-" + end + "/" + bytes.length);
+            e.sendResponseHeaders(range == null ? 200 : 206, length);
+            e.getResponseBody().write(bytes, start, length);
+            e.close();
+        }
+    }
     private static void sendJson(HttpExchange e,int code,String body)throws IOException{send(e,code,"application/json; charset=utf-8",body);}
     private static void send(HttpExchange e,int code,String type,String body)throws IOException{byte[]b=body.getBytes(StandardCharsets.UTF_8);e.getResponseHeaders().set("Content-Type",type);e.sendResponseHeaders(code,b.length);e.getResponseBody().write(b);e.close();}
     private static void append(StringBuilder b,String value){if(b.length()>1)b.append(',');b.append(value);}

@@ -14,17 +14,25 @@ import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.security.spec.InvalidKeySpecException;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
 
 /** Small dependency-free web server for the Hostel Laundry Management System. */
 public final class HostelLaundryWebServer {
     private static final String INITIAL_ADMIN_PASSWORD = setting("ADMIN_INITIAL_PASSWORD", "");
     private static final Map<String, UserSession> SESSIONS = new ConcurrentHashMap<>();
+    private static final SecureRandom PASSWORD_RANDOM = new SecureRandom();
+    private static final int PBKDF2_ITERATIONS = 210_000;
+    private static final int PBKDF2_KEY_BITS = 256;
+    private static final int MAX_REQUEST_BODY_BYTES = 65_536;
 
     public static void main(String[] args) throws IOException {
         int port = Integer.parseInt(setting("PORT", "8080"));
@@ -47,6 +55,7 @@ public final class HostelLaundryWebServer {
                 "CREATE TABLE IF NOT EXISTS notification (notification_id INT AUTO_INCREMENT PRIMARY KEY, student_id INT NOT NULL, message VARCHAR(500) NOT NULL, is_read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (student_id) REFERENCES student(student_id) ON DELETE CASCADE)"
             };
             for (String statement : schema) try (PreparedStatement table = c.prepareStatement(statement)) { table.execute(); }
+            try (PreparedStatement index = c.prepareStatement("CREATE INDEX idx_booking_machine_time ON booking(machine_id,booking_date,start_time,end_time,status)")) { index.execute(); } catch (SQLException ignored) { /* index already exists */ }
             String[][] machines = {{"Washing Machine 1","Block A","AVAILABLE"},{"Washing Machine 2","Block A","AVAILABLE"},{"Washing Machine 3","Block A","IN_USE"},{"Washing Machine 4","Block B","AVAILABLE"},{"Washing Machine 5","Block B","MAINTENANCE"},{"Washing Machine 6","Block B","AVAILABLE"}};
             for (String[] machine : machines) try (PreparedStatement seedMachine = c.prepareStatement("INSERT INTO machine(machine_name,hostel_block,status) SELECT ?,?,? WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name=?)")) { seedMachine.setString(1,machine[0]); seedMachine.setString(2,machine[1]); seedMachine.setString(3,machine[2]); seedMachine.setString(4,machine[0]); seedMachine.executeUpdate(); }
             if (!blank(INITIAL_ADMIN_PASSWORD)) {
@@ -79,7 +88,7 @@ public final class HostelLaundryWebServer {
         Map<String, String> form = form(ex);
         if (path.equals("/api/login") && ex.getRequestMethod().equals("POST")) { login(ex, form); return; }
         if (path.equals("/api/register") && ex.getRequestMethod().equals("POST")) { register(ex, form); return; }
-        if (path.equals("/api/logout")) { SESSIONS.remove(cookie(ex, "session")); sendJson(ex, 200, "{\"ok\":true}"); return; }
+        if (path.equals("/api/logout") && ex.getRequestMethod().equals("POST")) { SESSIONS.remove(cookie(ex, "session")); expireSessionCookie(ex); sendJson(ex, 200, "{\"ok\":true}"); return; }
         UserSession session = requireSession(ex);
         if (session == null) return;
         if (path.startsWith("/api/admin/")) { adminApi(ex, path, form, session); return; }
@@ -118,7 +127,7 @@ public final class HostelLaundryWebServer {
             try (ResultSet r = s.executeQuery()) {
                 if (!r.next() || !passwordMatches(password, r.getString("password"))) return null;
                 String stored = r.getString("password");
-                if (!stored.startsWith("sha256:")) { try (PreparedStatement u = c.prepareStatement("UPDATE " + table + " SET password=? WHERE " + idColumn + "=?")) { u.setString(1, hash(password)); u.setInt(2, r.getInt(1)); u.executeUpdate(); } }
+                if (!stored.startsWith("pbkdf2$")) { try (PreparedStatement u = c.prepareStatement("UPDATE " + table + " SET password=? WHERE " + idColumn + "=?")) { u.setString(1, hash(password)); u.setInt(2, r.getInt(1)); u.executeUpdate(); } }
                 return new UserSession(r.getInt(1), r.getString("name"), student ? "STUDENT" : "ADMIN", System.currentTimeMillis() + 7_200_000L);
             }
         }
@@ -127,7 +136,7 @@ public final class HostelLaundryWebServer {
     private static void register(HttpExchange ex, Map<String, String> f) throws IOException, SQLException {
         for (String key : new String[]{"name", "email", "password", "hostelBlock", "roomNumber"}) if (blank(f.get(key))) { sendJson(ex, 400, "{\"error\":\"Please complete all required fields\"}"); return; }
         if (Boolean.parseBoolean(setting("PRIVATE_BETA", "false")) && !invitedTester(f.get("email"))) { sendJson(ex, 403, "{\"error\":\"This private beta is invitation-only. Ask the project administrator for access.\"}"); return; }
-        if (!strongPassword(f.get("password"))) { sendJson(ex, 400, "{\"error\":\"Password must have 8+ characters with uppercase, lowercase, number, and symbol\"}"); return; }
+        if (!strongPassword(f.get("password"))) { sendJson(ex, 400, "{\"error\":\"Password must have 12+ characters with uppercase, lowercase, number, and symbol\"}"); return; }
         String sql = "INSERT INTO student (name,email,password,phone,hostel_block,room_number) VALUES (?,?,?,?,?,?)";
         try (Connection c = DatabaseConnection.getConnection(); PreparedStatement s = c.prepareStatement(sql)) {
             s.setString(1, f.get("name")); s.setString(2, f.get("email")); s.setString(3, hash(f.get("password"))); s.setString(4, f.getOrDefault("phone", "")); s.setString(5, f.get("hostelBlock")); s.setString(6, f.get("roomNumber")); s.executeUpdate();
@@ -162,12 +171,19 @@ public final class HostelLaundryWebServer {
         int machineId; LocalDate date; LocalTime start,end;
         try { machineId=Integer.parseInt(f.get("machineId")); date=LocalDate.parse(f.get("date")); start=LocalTime.parse(f.get("start")); end=LocalTime.parse(f.get("end")); } catch(Exception e) { sendJson(ex,400,"{\"error\":\"Invalid booking details\"}"); return; }
         if (!end.equals(start.plusHours(1)) || date.isBefore(LocalDate.now())) { sendJson(ex,400,"{\"error\":\"Bookings must be exactly one hour long and cannot be in the past\"}"); return; }
+        String lockName = "laundry-booking:" + machineId + ":" + date + ":" + start;
         try(Connection c=DatabaseConnection.getConnection()) {
-            String available="SELECT 1 FROM machine WHERE machine_id=? AND status='AVAILABLE'";
-            try(PreparedStatement s=c.prepareStatement(available)){s.setInt(1,machineId);try(ResultSet r=s.executeQuery()){if(!r.next()){sendJson(ex,409,"{\"error\":\"This machine is not available\"}");return;}}}
-            String overlap="SELECT 1 FROM booking WHERE machine_id=? AND booking_date=? AND status IN ('PENDING','ACTIVE') AND start_time < ? AND end_time > ?";
-            try(PreparedStatement s=c.prepareStatement(overlap)){s.setInt(1,machineId);s.setDate(2,java.sql.Date.valueOf(date));s.setTime(3,java.sql.Time.valueOf(end));s.setTime(4,java.sql.Time.valueOf(start));try(ResultSet r=s.executeQuery()){if(r.next()){sendJson(ex,409,"{\"error\":\"That time slot has already been booked\"}");return;}}}
-            try(PreparedStatement s=c.prepareStatement("INSERT INTO booking(student_id,machine_id,booking_date,start_time,end_time,status) VALUES(?,?,?,?,?,'PENDING')")){s.setInt(1,user.id());s.setInt(2,machineId);s.setDate(3,java.sql.Date.valueOf(date));s.setTime(4,java.sql.Time.valueOf(start));s.setTime(5,java.sql.Time.valueOf(end));s.executeUpdate();}
+            if (!acquireBookingLock(c, lockName)) { sendJson(ex, 429, "{\"error\":\"Booking is busy. Please try again in a moment.\"}"); return; }
+            try {
+                c.setAutoCommit(false);
+                String available="SELECT 1 FROM machine WHERE machine_id=? AND status='AVAILABLE' FOR UPDATE";
+                try(PreparedStatement s=c.prepareStatement(available)){s.setInt(1,machineId);try(ResultSet r=s.executeQuery()){if(!r.next()){c.rollback();sendJson(ex,409,"{\"error\":\"This machine is not available\"}");return;}}}
+                String overlap="SELECT 1 FROM booking WHERE machine_id=? AND booking_date=? AND status IN ('PENDING','ACTIVE') AND start_time < ? AND end_time > ? FOR UPDATE";
+                try(PreparedStatement s=c.prepareStatement(overlap)){s.setInt(1,machineId);s.setDate(2,java.sql.Date.valueOf(date));s.setTime(3,java.sql.Time.valueOf(end));s.setTime(4,java.sql.Time.valueOf(start));try(ResultSet r=s.executeQuery()){if(r.next()){c.rollback();sendJson(ex,409,"{\"error\":\"That time slot has already been booked\"}");return;}}}
+                try(PreparedStatement s=c.prepareStatement("INSERT INTO booking(student_id,machine_id,booking_date,start_time,end_time,status) VALUES(?,?,?,?,?,'PENDING')")){s.setInt(1,user.id());s.setInt(2,machineId);s.setDate(3,java.sql.Date.valueOf(date));s.setTime(4,java.sql.Time.valueOf(start));s.setTime(5,java.sql.Time.valueOf(end));s.executeUpdate();}
+                c.commit();
+            } catch (SQLException failure) { c.rollback(); throw failure; }
+            finally { releaseBookingLock(c, lockName); }
         }
         sendJson(ex,201,"{\"ok\":true}");
     }
@@ -177,7 +193,7 @@ public final class HostelLaundryWebServer {
     private static void createComplaint(HttpExchange ex,UserSession u,Map<String,String> f)throws IOException,SQLException{if(blank(f.get("text"))){sendJson(ex,400,"{\"error\":\"Please describe the issue\"}");return;}try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement("INSERT INTO complaint(student_id,machine_id,complaint_text,status) VALUES(?,?,?,'PENDING')")){s.setInt(1,u.id());s.setInt(2,Integer.parseInt(f.get("machineId")));s.setString(3,f.get("text"));s.executeUpdate();}sendJson(ex,201,"{\"ok\":true}");}
     private static void queue(HttpExchange ex)throws IOException,SQLException{String q="SELECT b.booking_date,b.start_time,b.end_time,m.machine_name FROM booking b JOIN machine m ON m.machine_id=b.machine_id WHERE b.status IN ('PENDING','ACTIVE') AND b.booking_date>=CURDATE() ORDER BY b.booking_date,b.start_time LIMIT 8";try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(q);ResultSet r=s.executeQuery()){StringBuilder o=new StringBuilder("[");while(r.next())append(o,"{\"date\":\""+r.getDate(1)+"\",\"start\":\""+r.getTime(2).toLocalTime()+"\",\"end\":\""+r.getTime(3).toLocalTime()+"\",\"machine\":\""+escape(r.getString(4))+"\"}");sendJson(ex,200,o.append(']').toString());}}
     private static void profile(HttpExchange ex, UserSession u) throws IOException, SQLException { try (Connection c=DatabaseConnection.getConnection(); PreparedStatement s=c.prepareStatement("SELECT name,email,phone,hostel_block,room_number FROM student WHERE student_id=?")) { s.setInt(1,u.id()); try(ResultSet r=s.executeQuery()){ if(!r.next()){sendJson(ex,404,"{\"error\":\"Profile not found\"}");return;} sendJson(ex,200,"{\"name\":\""+escape(r.getString(1))+"\",\"email\":\""+escape(r.getString(2))+"\",\"phone\":\""+escape(r.getString(3))+"\",\"hostelBlock\":\""+escape(r.getString(4))+"\",\"roomNumber\":\""+escape(r.getString(5))+"\"}"); } } }
-    private static void updateProfile(HttpExchange ex, UserSession u, Map<String,String> f) throws IOException, SQLException { if(blank(f.get("name"))||blank(f.get("hostelBlock"))||blank(f.get("roomNumber"))){sendJson(ex,400,"{\"error\":\"Name, hostel block and room number are required\"}");return;} if(!blank(f.get("newPassword"))&&!strongPassword(f.get("newPassword"))){sendJson(ex,400,"{\"error\":\"New password must have 8+ characters with uppercase, lowercase, number, and symbol\"}");return;} String q=blank(f.get("newPassword"))?"UPDATE student SET name=?,phone=?,hostel_block=?,room_number=? WHERE student_id=?":"UPDATE student SET name=?,phone=?,hostel_block=?,room_number=?,password=? WHERE student_id=?"; try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(q)){s.setString(1,f.get("name"));s.setString(2,f.getOrDefault("phone", ""));s.setString(3,f.get("hostelBlock"));s.setString(4,f.get("roomNumber"));if(blank(f.get("newPassword"))){s.setInt(5,u.id());}else{s.setString(5,hash(f.get("newPassword")));s.setInt(6,u.id());}s.executeUpdate();} SESSIONS.replaceAll((k,v)->v.id()==u.id()&&v.student()?new UserSession(v.id(),f.get("name"),v.role(),v.expiresAt()):v); sendJson(ex,200,"{\"ok\":true}"); }
+    private static void updateProfile(HttpExchange ex, UserSession u, Map<String,String> f) throws IOException, SQLException { if(blank(f.get("name"))||blank(f.get("hostelBlock"))||blank(f.get("roomNumber"))){sendJson(ex,400,"{\"error\":\"Name, hostel block and room number are required\"}");return;} if(!blank(f.get("newPassword"))&&!strongPassword(f.get("newPassword"))){sendJson(ex,400,"{\"error\":\"New password must have 12+ characters with uppercase, lowercase, number, and symbol\"}");return;} String q=blank(f.get("newPassword"))?"UPDATE student SET name=?,phone=?,hostel_block=?,room_number=? WHERE student_id=?":"UPDATE student SET name=?,phone=?,hostel_block=?,room_number=?,password=? WHERE student_id=?"; try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(q)){s.setString(1,f.get("name"));s.setString(2,f.getOrDefault("phone", ""));s.setString(3,f.get("hostelBlock"));s.setString(4,f.get("roomNumber"));if(blank(f.get("newPassword"))){s.setInt(5,u.id());}else{s.setString(5,hash(f.get("newPassword")));s.setInt(6,u.id());}s.executeUpdate();} SESSIONS.replaceAll((k,v)->v.id()==u.id()&&v.student()?new UserSession(v.id(),f.get("name"),v.role(),v.expiresAt()):v); sendJson(ex,200,"{\"ok\":true}"); }
     private static void notifications(HttpExchange ex, UserSession u) throws IOException, SQLException { String q="SELECT notification_id,message,is_read,created_at FROM notification WHERE student_id=? ORDER BY created_at DESC LIMIT 20";try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(q)){s.setInt(1,u.id());try(ResultSet r=s.executeQuery()){StringBuilder o=new StringBuilder("[");while(r.next())append(o,"{\"id\":"+r.getInt(1)+",\"message\":\""+escape(r.getString(2))+"\",\"read\":"+r.getBoolean(3)+",\"created\":\""+r.getTimestamp(4)+"\"}");sendJson(ex,200,o.append(']').toString());}} }
     private static void slots(HttpExchange ex) throws IOException, SQLException { Map<String,String> q=query(ex); if(blank(q.get("machineId"))||blank(q.get("date"))){sendJson(ex,400,"{\"error\":\"Machine and date are required\"}");return;} String sql="SELECT start_time FROM booking WHERE machine_id=? AND booking_date=? AND status IN ('PENDING','ACTIVE')";try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(sql)){s.setInt(1,Integer.parseInt(q.get("machineId")));s.setDate(2,java.sql.Date.valueOf(q.get("date")));try(ResultSet r=s.executeQuery()){StringBuilder o=new StringBuilder("[");while(r.next())append(o,"\""+r.getTime(1).toLocalTime()+"\"");sendJson(ex,200,o.append(']').toString());}} }
     private static void adminApi(HttpExchange ex, String path, Map<String,String> f, UserSession u) throws IOException, SQLException { if(u.student()){sendJson(ex,403,"{\"error\":\"Administrator access required\"}");return;} if(path.equals("/api/admin/dashboard")){adminDashboard(ex);return;} if(path.equals("/api/admin/machines")&&ex.getRequestMethod().equals("GET")){machines(ex);return;} if(path.equals("/api/admin/machines")&&ex.getRequestMethod().equals("POST")){saveMachine(ex,f);return;} if(path.equals("/api/admin/machine-delete")){deleteMachine(ex,f);return;} if(path.equals("/api/admin/bookings")){adminBookings(ex);return;} if(path.equals("/api/admin/booking-status")){updateBookingStatus(ex,f);return;} if(path.equals("/api/admin/complaints")){adminComplaints(ex);return;} if(path.equals("/api/admin/complaint-status")){updateComplaintStatus(ex,f);return;} sendJson(ex,404,"{\"error\":\"Unknown administrator endpoint\"}"); }
@@ -193,7 +209,7 @@ public final class HostelLaundryWebServer {
     private static boolean valid(String value,String...allowed){for(String item:allowed)if(item.equals(value))return true;return false;}
     private static String scalar(String sql,int...values)throws SQLException{try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(sql)){for(int i=0;i<values.length;i++)s.setInt(i+1,values[i]);try(ResultSet r=s.executeQuery()){r.next();return r.getString(1);}}}
     private static UserSession requireSession(HttpExchange ex)throws IOException{String token=cookie(ex,"session");UserSession s=SESSIONS.get(token);if(s==null||s.expiresAt()<System.currentTimeMillis()){SESSIONS.remove(token);sendJson(ex,401,"{\"error\":\"Your session has expired. Please log in again.\"}");return null;}return s;}
-    private static Map<String,String> form(HttpExchange e)throws IOException{Map<String,String> m=new HashMap<>();if(!e.getRequestMethod().equals("POST"))return m;String body=new String(e.getRequestBody().readAllBytes(),StandardCharsets.UTF_8);for(String p:body.split("&")){String[] a=p.split("=",2);if(a.length==2)m.put(URLDecoder.decode(a[0],StandardCharsets.UTF_8),URLDecoder.decode(a[1],StandardCharsets.UTF_8));}return m;}
+    private static Map<String,String> form(HttpExchange e)throws IOException{Map<String,String> m=new HashMap<>();if(!e.getRequestMethod().equals("POST"))return m;byte[] bodyBytes=e.getRequestBody().readNBytes(MAX_REQUEST_BODY_BYTES + 1);if(bodyBytes.length>MAX_REQUEST_BODY_BYTES)throw new IOException("Request is too large");String body=new String(bodyBytes,StandardCharsets.UTF_8);for(String p:body.split("&")){String[] a=p.split("=",2);if(a.length==2)m.put(URLDecoder.decode(a[0],StandardCharsets.UTF_8),URLDecoder.decode(a[1],StandardCharsets.UTF_8));}return m;}
     private static Map<String,String> query(HttpExchange e){Map<String,String> m=new HashMap<>();String raw=e.getRequestURI().getRawQuery();if(raw==null)return m;for(String p:raw.split("&")){String[]a=p.split("=",2);if(a.length==2)m.put(URLDecoder.decode(a[0],StandardCharsets.UTF_8),URLDecoder.decode(a[1],StandardCharsets.UTF_8));}return m;}
     private static String cookie(HttpExchange e,String key){String raw=e.getRequestHeaders().getFirst("Cookie");if(raw!=null)for(String p:raw.split(";")){String[]a=p.trim().split("=",2);if(a.length==2&&a[0].equals(key))return a[1];}return "";}
     private static void serveFile(HttpExchange e,String name,String type)throws IOException{try(InputStream in=HostelLaundryWebServer.class.getClassLoader().getResourceAsStream(name)){if(in==null){send(e,404,"text/plain","File not found");return;}send(e,200,type,new String(in.readAllBytes(),StandardCharsets.UTF_8));}}
@@ -228,8 +244,13 @@ public final class HostelLaundryWebServer {
     private static String setting(String name,String defaultValue){String value=System.getProperty(name);if(blank(value))value=System.getenv(name);return blank(value)?defaultValue:value;}
     private static boolean invitedTester(String email){for(String invited:setting("TESTER_EMAILS","").split(",")){if(invited.trim().equalsIgnoreCase(email==null?"":email.trim()))return true;}return false;}
     private static String escape(String value){return value==null?"":value.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","");}
-    private static boolean passwordMatches(String password, String stored) { return stored.startsWith("sha256:") ? stored.equals(hash(password)) : stored.equals(password); }
-    private static boolean strongPassword(String password) { return password != null && password.length() >= 8 && password.matches(".*[A-Z].*") && password.matches(".*[a-z].*") && password.matches(".*\\d.*") && password.matches(".*[^A-Za-z0-9].*"); }
-    private static String hash(String value) { try { byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)); StringBuilder out = new StringBuilder("sha256:"); for (byte b : digest) out.append(String.format("%02x", b)); return out.toString(); } catch (NoSuchAlgorithmException e) { throw new IllegalStateException(e); } }
+    private static boolean acquireBookingLock(Connection c, String name) throws SQLException { try (PreparedStatement s=c.prepareStatement("SELECT GET_LOCK(?, 5)")) { s.setString(1,name); try(ResultSet r=s.executeQuery()){return r.next()&&r.getInt(1)==1;} } }
+    private static void releaseBookingLock(Connection c, String name) { try (PreparedStatement s=c.prepareStatement("SELECT RELEASE_LOCK(?)")) { s.setString(1,name); s.execute(); } catch (SQLException ignored) { } }
+    private static void expireSessionCookie(HttpExchange e) { e.getResponseHeaders().add("Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (Boolean.parseBoolean(setting("COOKIE_SECURE", "false")) ? "; Secure" : "")); }
+    private static boolean passwordMatches(String password, String stored) { if (stored == null) return false; if (stored.startsWith("pbkdf2$")) { String[] parts=stored.split("\\$",4); if(parts.length!=4)return false; try { int iterations=Integer.parseInt(parts[1]); byte[] expected=Base64.getDecoder().decode(parts[3]); byte[] actual=pbkdf2(password,Base64.getDecoder().decode(parts[2]),iterations,expected.length*8); return MessageDigest.isEqual(expected,actual); } catch (IllegalArgumentException e) { return false; } } return stored.startsWith("sha256:") ? MessageDigest.isEqual(stored.getBytes(StandardCharsets.UTF_8),legacyHash(password).getBytes(StandardCharsets.UTF_8)) : MessageDigest.isEqual(stored.getBytes(StandardCharsets.UTF_8),password.getBytes(StandardCharsets.UTF_8)); }
+    private static boolean strongPassword(String password) { return password != null && password.length() >= 12 && password.matches(".*[A-Z].*") && password.matches(".*[a-z].*") && password.matches(".*\\d.*") && password.matches(".*[^A-Za-z0-9].*"); }
+    private static String hash(String value) { byte[] salt=new byte[16]; PASSWORD_RANDOM.nextBytes(salt); return "pbkdf2$"+PBKDF2_ITERATIONS+"$"+Base64.getEncoder().encodeToString(salt)+"$"+Base64.getEncoder().encodeToString(pbkdf2(value,salt,PBKDF2_ITERATIONS,PBKDF2_KEY_BITS)); }
+    private static byte[] pbkdf2(String value, byte[] salt, int iterations, int bits) { try { return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(new PBEKeySpec(value.toCharArray(),salt,iterations,bits)).getEncoded(); } catch (InvalidKeySpecException | java.security.NoSuchAlgorithmException e) { throw new IllegalStateException("Password hashing is unavailable",e); } }
+    private static String legacyHash(String value) { try { byte[] digest=MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));StringBuilder out=new StringBuilder("sha256:");for(byte b:digest)out.append(String.format("%02x",b));return out.toString();} catch(java.security.NoSuchAlgorithmException e){throw new IllegalStateException(e);} }
     private record UserSession(int id,String name,String role,long expiresAt) { boolean student() { return "STUDENT".equals(role); } }
 }

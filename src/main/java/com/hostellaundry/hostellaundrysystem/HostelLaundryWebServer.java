@@ -115,7 +115,7 @@ public final class HostelLaundryWebServer {
             if (user == null) user = loginFromTable(c, "student", "student_id", email, password, true);
             if (user == null) { sendJson(ex, 401, "{\"error\":\"Invalid email or password\"}"); return; }
             String token = UUID.randomUUID().toString(); SESSIONS.put(token, user);
-            ex.getResponseHeaders().add("Set-Cookie", "session=" + token + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=7200" + (Boolean.parseBoolean(setting("COOKIE_SECURE", "false")) ? "; Secure" : ""));
+            ex.getResponseHeaders().add("Set-Cookie", "session=" + token + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=7200" + (secureCookie(ex) ? "; Secure" : ""));
             sendJson(ex, 200, "{\"name\":\"" + escape(user.name()) + "\",\"role\":\"" + user.role() + "\"}");
         }
     }
@@ -246,7 +246,8 @@ public final class HostelLaundryWebServer {
     private static String escape(String value){return value==null?"":value.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","");}
     private static boolean acquireBookingLock(Connection c, String name) throws SQLException { try (PreparedStatement s=c.prepareStatement("SELECT GET_LOCK(?, 5)")) { s.setString(1,name); try(ResultSet r=s.executeQuery()){return r.next()&&r.getInt(1)==1;} } }
     private static void releaseBookingLock(Connection c, String name) { try (PreparedStatement s=c.prepareStatement("SELECT RELEASE_LOCK(?)")) { s.setString(1,name); s.execute(); } catch (SQLException ignored) { } }
-    private static void expireSessionCookie(HttpExchange e) { e.getResponseHeaders().add("Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (Boolean.parseBoolean(setting("COOKIE_SECURE", "false")) ? "; Secure" : "")); }
+    private static boolean secureCookie(HttpExchange e) { String forwarded=e.getRequestHeaders().getFirst("X-Forwarded-Proto"); return Boolean.parseBoolean(setting("COOKIE_SECURE", "false")) || (forwarded != null && forwarded.equalsIgnoreCase("https")); }
+    private static void expireSessionCookie(HttpExchange e) { e.getResponseHeaders().add("Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (secureCookie(e) ? "; Secure" : "")); }
     private static boolean passwordMatches(String password, String stored) { if (stored == null) return false; if (stored.startsWith("pbkdf2$")) { String[] parts=stored.split("\\$",4); if(parts.length!=4)return false; try { int iterations=Integer.parseInt(parts[1]); byte[] expected=Base64.getDecoder().decode(parts[3]); byte[] actual=pbkdf2(password,Base64.getDecoder().decode(parts[2]),iterations,expected.length*8); return MessageDigest.isEqual(expected,actual); } catch (IllegalArgumentException e) { return false; } } return stored.startsWith("sha256:") ? MessageDigest.isEqual(stored.getBytes(StandardCharsets.UTF_8),legacyHash(password).getBytes(StandardCharsets.UTF_8)) : MessageDigest.isEqual(stored.getBytes(StandardCharsets.UTF_8),password.getBytes(StandardCharsets.UTF_8)); }
     private static boolean strongPassword(String password) { return password != null && password.length() >= 12 && password.matches(".*[A-Z].*") && password.matches(".*[a-z].*") && password.matches(".*\\d.*") && password.matches(".*[^A-Za-z0-9].*"); }
     private static String hash(String value) { byte[] salt=new byte[16]; PASSWORD_RANDOM.nextBytes(salt); return "pbkdf2$"+PBKDF2_ITERATIONS+"$"+Base64.getEncoder().encodeToString(salt)+"$"+Base64.getEncoder().encodeToString(pbkdf2(value,salt,PBKDF2_ITERATIONS,PBKDF2_KEY_BITS)); }

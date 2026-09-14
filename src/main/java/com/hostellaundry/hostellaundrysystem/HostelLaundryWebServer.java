@@ -18,7 +18,9 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.spec.InvalidKeySpecException;
 import java.util.Base64;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -62,6 +64,7 @@ public final class HostelLaundryWebServer {
             applyRequestedFacilityLayout(c);
             String[][] machines = {{"Washing Machine 1","Block A","AVAILABLE"},{"Washing Machine 2","Block A","IN_USE"},{"Washing Machine 3","Block A","AVAILABLE"},{"Dryer 1","Block A","MAINTENANCE"},{"Dryer 2","Block A","AVAILABLE"},{"Dryer 3","Block A","AVAILABLE"}};
             for (String[] machine : machines) try (PreparedStatement seedMachine = c.prepareStatement("INSERT INTO machine(machine_name,hostel_block,status) SELECT ?,?,? WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name=?)")) { seedMachine.setString(1,machine[0]); seedMachine.setString(2,machine[1]); seedMachine.setString(3,machine[2]); seedMachine.setString(4,machine[0]); seedMachine.executeUpdate(); }
+            removeUnusedMachineDuplicates(c, machines);
             if (!blank(INITIAL_ADMIN_PASSWORD)) {
                 try (PreparedStatement seed = c.prepareStatement("INSERT IGNORE INTO admin(name,email,password) VALUES('Laundry Administrator','admin@hostellaundry.com',?)")) { seed.setString(1, hash(INITIAL_ADMIN_PASSWORD)); seed.executeUpdate(); }
             }
@@ -77,6 +80,36 @@ public final class HostelLaundryWebServer {
         for (String[] change : renamed) {
             try (PreparedStatement rename = c.prepareStatement("UPDATE machine SET machine_name=?, hostel_block='Block A' WHERE machine_id=?")) {
                 rename.setString(1, change[1]); rename.setInt(2, Integer.parseInt(change[0])); rename.executeUpdate();
+            }
+        }
+        // A previous layout update may have created a second "Washing Machine 2".
+        // Remove only that extra row when it has no booking or complaint history.
+        try (PreparedStatement duplicate = c.prepareStatement(
+                "DELETE FROM machine WHERE machine_id > 6 AND machine_name='Washing Machine 2' "
+                + "AND NOT EXISTS (SELECT 1 FROM booking WHERE booking.machine_id=machine.machine_id) "
+                + "AND NOT EXISTS (SELECT 1 FROM complaint WHERE complaint.machine_id=machine.machine_id)")) {
+            duplicate.executeUpdate();
+        }
+    }
+
+    /** Removes only duplicate seed records that have no booking or complaint history. */
+    private static void removeUnusedMachineDuplicates(Connection c, String[][] machines) throws SQLException {
+        for (String[] machine : machines) {
+            String ids = "SELECT machine_id FROM machine WHERE machine_name=? ORDER BY machine_id";
+            List<Integer> duplicates = new ArrayList<>();
+            try (PreparedStatement find = c.prepareStatement(ids)) {
+                find.setString(1, machine[0]);
+                try (ResultSet rows = find.executeQuery()) {
+                    boolean keepFirst = true;
+                    while (rows.next()) {
+                        int id = rows.getInt(1);
+                        if (keepFirst) { keepFirst = false; continue; }
+                        duplicates.add(id);
+                    }
+                }
+            }
+            for (int id : duplicates) try (PreparedStatement remove = c.prepareStatement("DELETE FROM machine WHERE machine_id=? AND NOT EXISTS (SELECT 1 FROM booking WHERE machine_id=?) AND NOT EXISTS (SELECT 1 FROM complaint WHERE machine_id=?)")) {
+                remove.setInt(1, id); remove.setInt(2, id); remove.setInt(3, id); remove.executeUpdate();
             }
         }
     }

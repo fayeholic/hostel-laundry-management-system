@@ -45,6 +45,32 @@ CREATE TABLE IF NOT EXISTS complaint (
     FOREIGN KEY (machine_id) REFERENCES machine(machine_id)
 );
 
+CREATE TABLE IF NOT EXISTS admin (
+    admin_id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS notification (
+    notification_id INT AUTO_INCREMENT PRIMARY KEY,
+    student_id INT NOT NULL,
+    message VARCHAR(500) NOT NULL,
+    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (student_id) REFERENCES student(student_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS password_reset_request (
+    request_id INT AUTO_INCREMENT PRIMARY KEY,
+    student_id INT NOT NULL,
+    status ENUM('PENDING', 'COMPLETED') NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP NULL,
+    FOREIGN KEY (student_id) REFERENCES student(student_id) ON DELETE CASCADE
+);
+
 -- Initial machines for public testing.
 INSERT INTO machine (machine_name, hostel_block, status)
 SELECT 'Washing Machine 1', 'Block A', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 1');

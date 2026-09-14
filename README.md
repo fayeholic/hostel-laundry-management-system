@@ -30,3 +30,11 @@ With `PRIVATE_BETA=false`, anyone with the website link can create a student acc
 Before deploying, import `database/schema.sql` into the managed MySQL database, then set the environment variables above. The application creates its `admin` and `notification` support tables when it starts.
 
 Set `ADMIN_INITIAL_PASSWORD` to a strong secret before the first start. The application creates the administrator account as `admin@hostellaundry.com` without ever storing that password in GitHub.
+
+## Administrator reports, password recovery, and WhatsApp
+
+- Students can use **Forgot password?** to make a reset request without revealing whether an email exists.
+- In **Reports & exports**, an administrator sets a strong temporary password for the request. The application then prepares a `wa.me` WhatsApp link using the student phone number. The administrator reviews and sends the message in their own WhatsApp account.
+- The same page downloads student, booking, and complaint records as CSV reports. Do not publish downloaded reports because they contain personal data.
+
+This is a WhatsApp-assisted workflow, not an automated WhatsApp Business API sender. Fully automatic WhatsApp delivery requires a separately approved Meta WhatsApp Business account, phone number, API access token, and a template message; those credentials must be configured in the hosting service and never committed to GitHub.

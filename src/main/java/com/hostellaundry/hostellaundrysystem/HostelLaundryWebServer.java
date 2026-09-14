@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -29,6 +30,7 @@ import javax.crypto.spec.PBEKeySpec;
 public final class HostelLaundryWebServer {
     private static final String INITIAL_ADMIN_PASSWORD = setting("ADMIN_INITIAL_PASSWORD", "");
     private static final Map<String, UserSession> SESSIONS = new ConcurrentHashMap<>();
+    private static final Map<String, Long> RESET_REQUEST_LIMIT = new ConcurrentHashMap<>();
     private static final SecureRandom PASSWORD_RANDOM = new SecureRandom();
     private static final int PBKDF2_ITERATIONS = 210_000;
     private static final int PBKDF2_KEY_BITS = 256;
@@ -52,7 +54,8 @@ public final class HostelLaundryWebServer {
                 "CREATE TABLE IF NOT EXISTS booking (booking_id INT AUTO_INCREMENT PRIMARY KEY, student_id INT NOT NULL, machine_id INT NOT NULL, booking_date DATE NOT NULL, start_time TIME NOT NULL, end_time TIME NOT NULL, status ENUM('PENDING','ACTIVE','COMPLETED','CANCELLED') DEFAULT 'PENDING', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (student_id) REFERENCES student(student_id), FOREIGN KEY (machine_id) REFERENCES machine(machine_id))",
                 "CREATE TABLE IF NOT EXISTS complaint (complaint_id INT AUTO_INCREMENT PRIMARY KEY, student_id INT NOT NULL, machine_id INT NOT NULL, complaint_text VARCHAR(500) NOT NULL, status ENUM('PENDING','IN_PROGRESS','RESOLVED') DEFAULT 'PENDING', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (student_id) REFERENCES student(student_id), FOREIGN KEY (machine_id) REFERENCES machine(machine_id))",
                 "CREATE TABLE IF NOT EXISTS admin (admin_id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(100) UNIQUE NOT NULL, password VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-                "CREATE TABLE IF NOT EXISTS notification (notification_id INT AUTO_INCREMENT PRIMARY KEY, student_id INT NOT NULL, message VARCHAR(500) NOT NULL, is_read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (student_id) REFERENCES student(student_id) ON DELETE CASCADE)"
+                "CREATE TABLE IF NOT EXISTS notification (notification_id INT AUTO_INCREMENT PRIMARY KEY, student_id INT NOT NULL, message VARCHAR(500) NOT NULL, is_read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (student_id) REFERENCES student(student_id) ON DELETE CASCADE)",
+                "CREATE TABLE IF NOT EXISTS password_reset_request (request_id INT AUTO_INCREMENT PRIMARY KEY, student_id INT NOT NULL, status ENUM('PENDING','COMPLETED') NOT NULL DEFAULT 'PENDING', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, completed_at TIMESTAMP NULL, FOREIGN KEY (student_id) REFERENCES student(student_id) ON DELETE CASCADE)"
             };
             for (String statement : schema) try (PreparedStatement table = c.prepareStatement(statement)) { table.execute(); }
             try (PreparedStatement index = c.prepareStatement("CREATE INDEX idx_booking_machine_time ON booking(machine_id,booking_date,start_time,end_time,status)")) { index.execute(); } catch (SQLException ignored) { /* index already exists */ }
@@ -88,6 +91,7 @@ public final class HostelLaundryWebServer {
         Map<String, String> form = form(ex);
         if (path.equals("/api/login") && ex.getRequestMethod().equals("POST")) { login(ex, form); return; }
         if (path.equals("/api/register") && ex.getRequestMethod().equals("POST")) { register(ex, form); return; }
+        if (path.equals("/api/forgot-password") && ex.getRequestMethod().equals("POST")) { requestPasswordReset(ex, form); return; }
         if (path.equals("/api/logout") && ex.getRequestMethod().equals("POST")) { SESSIONS.remove(cookie(ex, "session")); expireSessionCookie(ex); sendJson(ex, 200, "{\"ok\":true}"); return; }
         UserSession session = requireSession(ex);
         if (session == null) return;
@@ -146,6 +150,36 @@ public final class HostelLaundryWebServer {
         sendJson(ex, 201, "{\"ok\":true}");
     }
 
+    /**
+     * Starts an administrator-assisted password reset without revealing whether an
+     * email is registered. The administrator can set a temporary password and
+     * contact the student through the phone number that the student supplied.
+     */
+    private static void requestPasswordReset(HttpExchange ex, Map<String, String> f) throws IOException, SQLException {
+        String email = f.getOrDefault("email", "").trim().toLowerCase();
+        String forwarded = ex.getRequestHeaders().getFirst("X-Forwarded-For");
+        String client = !blank(forwarded) ? forwarded.split(",", 2)[0].trim() : (ex.getRemoteAddress().getAddress() == null ? "unknown" : ex.getRemoteAddress().getAddress().getHostAddress());
+        long now = System.currentTimeMillis();
+        Long previous = RESET_REQUEST_LIMIT.put(client, now);
+        if (previous != null && now - previous < 60_000L) {
+            sendJson(ex, 429, "{\"error\":\"Please wait one minute before submitting another reset request.\"}");
+            return;
+        }
+        if (blank(email) || !email.contains("@")) {
+            sendJson(ex, 400, "{\"error\":\"Enter a valid email address.\"}");
+            return;
+        }
+        String sql = "INSERT INTO password_reset_request(student_id) "
+                + "SELECT s.student_id FROM student s WHERE LOWER(s.email)=? "
+                + "AND NOT EXISTS (SELECT 1 FROM password_reset_request p WHERE p.student_id=s.student_id AND p.status='PENDING')";
+        try (Connection c = DatabaseConnection.getConnection(); PreparedStatement s = c.prepareStatement(sql)) {
+            s.setString(1, email);
+            s.executeUpdate();
+        }
+        // This response is deliberately identical for existing and unknown emails.
+        sendJson(ex, 200, "{\"ok\":true}");
+    }
+
     private static void dashboard(HttpExchange ex, UserSession user) throws IOException, SQLException {
         if (!user.student()) { sendJson(ex, 200, "{\"name\":\"" + escape(user.name()) + "\",\"role\":\"ADMIN\"}"); return; }
         String machine = scalar("SELECT COUNT(*) FROM machine");
@@ -196,10 +230,76 @@ public final class HostelLaundryWebServer {
     private static void updateProfile(HttpExchange ex, UserSession u, Map<String,String> f) throws IOException, SQLException { if(blank(f.get("name"))||blank(f.get("hostelBlock"))||blank(f.get("roomNumber"))){sendJson(ex,400,"{\"error\":\"Name, hostel block and room number are required\"}");return;} if(!blank(f.get("newPassword"))&&!strongPassword(f.get("newPassword"))){sendJson(ex,400,"{\"error\":\"New password must have 12+ characters with uppercase, lowercase, number, and symbol\"}");return;} String q=blank(f.get("newPassword"))?"UPDATE student SET name=?,phone=?,hostel_block=?,room_number=? WHERE student_id=?":"UPDATE student SET name=?,phone=?,hostel_block=?,room_number=?,password=? WHERE student_id=?"; try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(q)){s.setString(1,f.get("name"));s.setString(2,f.getOrDefault("phone", ""));s.setString(3,f.get("hostelBlock"));s.setString(4,f.get("roomNumber"));if(blank(f.get("newPassword"))){s.setInt(5,u.id());}else{s.setString(5,hash(f.get("newPassword")));s.setInt(6,u.id());}s.executeUpdate();} SESSIONS.replaceAll((k,v)->v.id()==u.id()&&v.student()?new UserSession(v.id(),f.get("name"),v.role(),v.expiresAt()):v); sendJson(ex,200,"{\"ok\":true}"); }
     private static void notifications(HttpExchange ex, UserSession u) throws IOException, SQLException { String q="SELECT notification_id,message,is_read,created_at FROM notification WHERE student_id=? ORDER BY created_at DESC LIMIT 20";try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(q)){s.setInt(1,u.id());try(ResultSet r=s.executeQuery()){StringBuilder o=new StringBuilder("[");while(r.next())append(o,"{\"id\":"+r.getInt(1)+",\"message\":\""+escape(r.getString(2))+"\",\"read\":"+r.getBoolean(3)+",\"created\":\""+r.getTimestamp(4)+"\"}");sendJson(ex,200,o.append(']').toString());}} }
     private static void slots(HttpExchange ex) throws IOException, SQLException { Map<String,String> q=query(ex); if(blank(q.get("machineId"))||blank(q.get("date"))){sendJson(ex,400,"{\"error\":\"Machine and date are required\"}");return;} String sql="SELECT start_time FROM booking WHERE machine_id=? AND booking_date=? AND status IN ('PENDING','ACTIVE')";try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(sql)){s.setInt(1,Integer.parseInt(q.get("machineId")));s.setDate(2,java.sql.Date.valueOf(q.get("date")));try(ResultSet r=s.executeQuery()){StringBuilder o=new StringBuilder("[");while(r.next())append(o,"\""+r.getTime(1).toLocalTime()+"\"");sendJson(ex,200,o.append(']').toString());}} }
-    private static void adminApi(HttpExchange ex, String path, Map<String,String> f, UserSession u) throws IOException, SQLException { if(u.student()){sendJson(ex,403,"{\"error\":\"Administrator access required\"}");return;} if(path.equals("/api/admin/dashboard")){adminDashboard(ex);return;} if(path.equals("/api/admin/profile")&&ex.getRequestMethod().equals("GET")){adminProfile(ex,u);return;} if(path.equals("/api/admin/profile")&&ex.getRequestMethod().equals("POST")){changeAdminPassword(ex,u,f);return;} if(path.equals("/api/admin/machines")&&ex.getRequestMethod().equals("GET")){machines(ex);return;} if(path.equals("/api/admin/machines")&&ex.getRequestMethod().equals("POST")){saveMachine(ex,f);return;} if(path.equals("/api/admin/machine-delete")){deleteMachine(ex,f);return;} if(path.equals("/api/admin/bookings")){adminBookings(ex);return;} if(path.equals("/api/admin/booking-status")){updateBookingStatus(ex,f);return;} if(path.equals("/api/admin/complaints")){adminComplaints(ex);return;} if(path.equals("/api/admin/complaint-status")){updateComplaintStatus(ex,f);return;} sendJson(ex,404,"{\"error\":\"Unknown administrator endpoint\"}"); }
-    private static void adminDashboard(HttpExchange ex)throws IOException,SQLException{sendJson(ex,200,"{\"students\":"+scalar("SELECT COUNT(*) FROM student")+",\"machines\":"+scalar("SELECT COUNT(*) FROM machine")+",\"bookings\":"+scalar("SELECT COUNT(*) FROM booking WHERE status IN ('PENDING','ACTIVE')")+",\"complaints\":"+scalar("SELECT COUNT(*) FROM complaint WHERE status <> 'RESOLVED'")+"}");}
+    private static void adminApi(HttpExchange ex, String path, Map<String,String> f, UserSession u) throws IOException, SQLException {
+        if (u.student()) { sendJson(ex,403,"{\"error\":\"Administrator access required\"}"); return; }
+        if (path.equals("/api/admin/dashboard")) { adminDashboard(ex); return; }
+        if (path.equals("/api/admin/profile") && ex.getRequestMethod().equals("GET")) { adminProfile(ex,u); return; }
+        if (path.equals("/api/admin/profile") && ex.getRequestMethod().equals("POST")) { changeAdminPassword(ex,u,f); return; }
+        if (path.equals("/api/admin/machines") && ex.getRequestMethod().equals("GET")) { machines(ex); return; }
+        if (path.equals("/api/admin/machines") && ex.getRequestMethod().equals("POST")) { saveMachine(ex,f); return; }
+        if (path.equals("/api/admin/machine-delete")) { deleteMachine(ex,f); return; }
+        if (path.equals("/api/admin/bookings")) { adminBookings(ex); return; }
+        if (path.equals("/api/admin/booking-status")) { updateBookingStatus(ex,f); return; }
+        if (path.equals("/api/admin/complaints")) { adminComplaints(ex); return; }
+        if (path.equals("/api/admin/complaint-status")) { updateComplaintStatus(ex,f); return; }
+        if (path.equals("/api/admin/password-reset-requests") && ex.getRequestMethod().equals("GET")) { resetRequests(ex); return; }
+        if (path.equals("/api/admin/reset-student-password") && ex.getRequestMethod().equals("POST")) { resetStudentPassword(ex,f); return; }
+        if (path.equals("/api/admin/export") && ex.getRequestMethod().equals("GET")) { exportCsv(ex); return; }
+        sendJson(ex,404,"{\"error\":\"Unknown administrator endpoint\"}");
+    }
+    private static void adminDashboard(HttpExchange ex)throws IOException,SQLException{sendJson(ex,200,"{\"students\":"+scalar("SELECT COUNT(*) FROM student")+",\"machines\":"+scalar("SELECT COUNT(*) FROM machine")+",\"bookings\":"+scalar("SELECT COUNT(*) FROM booking WHERE status IN ('PENDING','ACTIVE')")+",\"complaints\":"+scalar("SELECT COUNT(*) FROM complaint WHERE status <> 'RESOLVED'")+",\"passwordResetRequests\":"+scalar("SELECT COUNT(*) FROM password_reset_request WHERE status='PENDING'")+"}");}
     private static void adminProfile(HttpExchange ex, UserSession u)throws IOException,SQLException{try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement("SELECT name,email FROM admin WHERE admin_id=?")){s.setInt(1,u.id());try(ResultSet r=s.executeQuery()){if(!r.next()){sendJson(ex,404,"{\"error\":\"Administrator account not found\"}");return;}sendJson(ex,200,"{\"name\":\""+escape(r.getString(1))+"\",\"email\":\""+escape(r.getString(2))+"\"}");}}}
     private static void changeAdminPassword(HttpExchange ex,UserSession u,Map<String,String> f)throws IOException,SQLException{String current=f.getOrDefault("currentPassword","");String next=f.getOrDefault("newPassword","");if(blank(current)||blank(next)){sendJson(ex,400,"{\"error\":\"Enter your current password and a new password\"}");return;}if(!strongPassword(next)){sendJson(ex,400,"{\"error\":\"New password must have 12+ characters with uppercase, lowercase, number, and symbol\"}");return;}try(Connection c=DatabaseConnection.getConnection();PreparedStatement find=c.prepareStatement("SELECT password FROM admin WHERE admin_id=?")){find.setInt(1,u.id());try(ResultSet r=find.executeQuery()){if(!r.next()||!passwordMatches(current,r.getString(1))){sendJson(ex,401,"{\"error\":\"Your current password is incorrect\"}");return;}}try(PreparedStatement save=c.prepareStatement("UPDATE admin SET password=? WHERE admin_id=?")){save.setString(1,hash(next));save.setInt(2,u.id());save.executeUpdate();}}sendJson(ex,200,"{\"ok\":true}");}
+    private static void resetRequests(HttpExchange ex) throws IOException, SQLException {
+        String q = "SELECT p.request_id,s.name,s.email,s.phone,p.created_at FROM password_reset_request p JOIN student s ON s.student_id=p.student_id WHERE p.status='PENDING' ORDER BY p.created_at";
+        try (Connection c=DatabaseConnection.getConnection(); PreparedStatement s=c.prepareStatement(q); ResultSet r=s.executeQuery()) {
+            StringBuilder out=new StringBuilder("[");
+            while(r.next()) append(out,"{\"id\":"+r.getInt(1)+",\"student\":\""+escape(r.getString(2))+"\",\"email\":\""+escape(r.getString(3))+"\",\"phone\":\""+escape(r.getString(4))+"\",\"created\":\""+r.getTimestamp(5)+"\"}");
+            sendJson(ex,200,out.append(']').toString());
+        }
+    }
+    private static void resetStudentPassword(HttpExchange ex, Map<String,String> f) throws IOException, SQLException {
+        int requestId;
+        try { requestId=Integer.parseInt(f.get("id")); } catch (Exception e) { sendJson(ex,400,"{\"error\":\"Invalid password reset request\"}"); return; }
+        String newPassword=f.getOrDefault("newPassword","");
+        if (!strongPassword(newPassword)) { sendJson(ex,400,"{\"error\":\"Temporary password must have 12+ characters with uppercase, lowercase, number, and symbol\"}"); return; }
+        String name="", phone="";
+        try (Connection c=DatabaseConnection.getConnection()) {
+            c.setAutoCommit(false);
+            try (PreparedStatement find=c.prepareStatement("SELECT s.student_id,s.name,s.phone FROM password_reset_request p JOIN student s ON s.student_id=p.student_id WHERE p.request_id=? AND p.status='PENDING' FOR UPDATE")) {
+                find.setInt(1,requestId);
+                try(ResultSet r=find.executeQuery()) {
+                    if(!r.next()){c.rollback();sendJson(ex,404,"{\"error\":\"Password reset request was not found or has already been completed\"}");return;}
+                    int studentId=r.getInt(1); name=r.getString(2); phone=r.getString(3);
+                    try(PreparedStatement update=c.prepareStatement("UPDATE student SET password=? WHERE student_id=?")){update.setString(1,hash(newPassword));update.setInt(2,studentId);update.executeUpdate();}
+                    try(PreparedStatement done=c.prepareStatement("UPDATE password_reset_request SET status='COMPLETED',completed_at=CURRENT_TIMESTAMP WHERE request_id=?")){done.setInt(1,requestId);done.executeUpdate();}
+                    try(PreparedStatement notification=c.prepareStatement("INSERT INTO notification(student_id,message) VALUES(?,?)")){notification.setInt(1,studentId);notification.setString(2,"Your password reset was completed by the laundry administrator. Please change the temporary password in My Profile after logging in.");notification.executeUpdate();}
+                }
+            }
+            c.commit();
+        }
+        String normalized=normalizeWhatsApp(phone);
+        String url="";
+        if(!blank(normalized)) {
+            String message="Hello "+name+", your Hostel Laundry account password reset is ready. Your temporary password is: "+newPassword+". Please log in and change it immediately in My Profile.";
+            url="https://wa.me/"+normalized+"?text="+URLEncoder.encode(message,StandardCharsets.UTF_8);
+        }
+        sendJson(ex,200,"{\"ok\":true,\"whatsAppUrl\":\""+escape(url)+"\"}");
+    }
+    private static void exportCsv(HttpExchange ex) throws IOException, SQLException {
+        String type=query(ex).getOrDefault("type","");
+        String sql, file;
+        if("students".equals(type)){sql="SELECT student_id,name,email,phone,hostel_block,room_number,created_at FROM student ORDER BY student_id";file="students.csv";}
+        else if("bookings".equals(type)){sql="SELECT b.booking_id,s.name,m.machine_name,b.booking_date,b.start_time,b.end_time,b.status,b.created_at FROM booking b JOIN student s ON s.student_id=b.student_id JOIN machine m ON m.machine_id=b.machine_id ORDER BY b.booking_date DESC,b.start_time DESC";file="bookings.csv";}
+        else if("complaints".equals(type)){sql="SELECT c.complaint_id,s.name,m.machine_name,c.complaint_text,c.status,c.created_at FROM complaint c JOIN student s ON s.student_id=c.student_id JOIN machine m ON m.machine_id=c.machine_id ORDER BY c.created_at DESC";file="complaints.csv";}
+        else {sendJson(ex,400,"{\"error\":\"Choose students, bookings, or complaints to export\"}");return;}
+        try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(sql);ResultSet r=s.executeQuery()){
+            StringBuilder csv=new StringBuilder();int count=r.getMetaData().getColumnCount();
+            for(int i=1;i<=count;i++){if(i>1)csv.append(',');csv.append(csv(r.getMetaData().getColumnLabel(i)));}csv.append('\n');
+            while(r.next()){for(int i=1;i<=count;i++){if(i>1)csv.append(',');csv.append(csv(r.getString(i)));}csv.append('\n');}
+            byte[] bytes=csv.toString().getBytes(StandardCharsets.UTF_8);ex.getResponseHeaders().set("Content-Type","text/csv; charset=utf-8");ex.getResponseHeaders().set("Content-Disposition","attachment; filename=\""+file+"\"");ex.getResponseHeaders().set("Cache-Control","no-store");ex.sendResponseHeaders(200,bytes.length);ex.getResponseBody().write(bytes);ex.close();
+        }
+    }
     private static void saveMachine(HttpExchange ex,Map<String,String> f)throws IOException,SQLException{if(blank(f.get("block"))||!valid(f.get("status"),"AVAILABLE","IN_USE","MAINTENANCE")){sendJson(ex,400,"{\"error\":\"Choose a valid block and machine status\"}");return;}try(Connection c=DatabaseConnection.getConnection()){if(blank(f.get("id"))){String name=f.get("name");if(blank(name)){try(PreparedStatement n=c.prepareStatement("SELECT COALESCE(MAX(machine_id),0)+1 FROM machine");ResultSet r=n.executeQuery()){r.next();name="Washing Machine "+r.getInt(1);}}try(PreparedStatement s=c.prepareStatement("INSERT INTO machine(machine_name,hostel_block,status) VALUES(?,?,?)")){s.setString(1,name);s.setString(2,f.get("block"));s.setString(3,f.get("status"));s.executeUpdate();}}else{try(PreparedStatement s=c.prepareStatement("UPDATE machine SET hostel_block=?,status=? WHERE machine_id=?")){s.setString(1,f.get("block"));s.setString(2,f.get("status"));s.setInt(3,Integer.parseInt(f.get("id")));if(s.executeUpdate()==0){sendJson(ex,404,"{\"error\":\"Machine not found\"}");return;}}}}sendJson(ex,200,"{\"ok\":true}");}
     private static void deleteMachine(HttpExchange ex,Map<String,String> f)throws IOException,SQLException{try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement("DELETE FROM machine WHERE machine_id=? AND NOT EXISTS (SELECT 1 FROM booking WHERE machine_id=? ) AND NOT EXISTS (SELECT 1 FROM complaint WHERE machine_id=?)")){int id=Integer.parseInt(f.get("id"));s.setInt(1,id);s.setInt(2,id);s.setInt(3,id);if(s.executeUpdate()==0){sendJson(ex,409,"{\"error\":\"Machine cannot be removed because it has booking or complaint history\"}");return;}}sendJson(ex,200,"{\"ok\":true}");}
     private static void adminBookings(HttpExchange ex)throws IOException,SQLException{String q="SELECT b.booking_id,s.student_id,s.name,m.machine_name,b.booking_date,b.start_time,b.end_time,b.status FROM booking b JOIN student s ON s.student_id=b.student_id JOIN machine m ON m.machine_id=b.machine_id ORDER BY b.booking_date DESC,b.start_time DESC";try(Connection c=DatabaseConnection.getConnection();PreparedStatement s=c.prepareStatement(q);ResultSet r=s.executeQuery()){StringBuilder o=new StringBuilder("[");while(r.next())append(o,"{\"id\":"+r.getInt(1)+",\"studentId\":"+r.getInt(2)+",\"student\":\""+escape(r.getString(3))+"\",\"machine\":\""+escape(r.getString(4))+"\",\"date\":\""+r.getDate(5)+"\",\"start\":\""+r.getTime(6).toLocalTime()+"\",\"end\":\""+r.getTime(7).toLocalTime()+"\",\"status\":\""+r.getString(8)+"\"}");sendJson(ex,200,o.append(']').toString());}}
@@ -246,6 +346,8 @@ public final class HostelLaundryWebServer {
     private static String setting(String name,String defaultValue){String value=System.getProperty(name);if(blank(value))value=System.getenv(name);return blank(value)?defaultValue:value;}
     private static boolean invitedTester(String email){for(String invited:setting("TESTER_EMAILS","").split(",")){if(invited.trim().equalsIgnoreCase(email==null?"":email.trim()))return true;}return false;}
     private static String escape(String value){return value==null?"":value.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","");}
+    private static String csv(String value){return "\""+(value==null?"":value.replace("\"","\"\""))+"\"";}
+    private static String normalizeWhatsApp(String phone){String digits=phone==null?"":phone.replaceAll("[^0-9]","");if(digits.startsWith("0"))digits="6"+digits;return digits.length()>=10&&digits.length()<=15?digits:"";}
     private static boolean acquireBookingLock(Connection c, String name) throws SQLException { try (PreparedStatement s=c.prepareStatement("SELECT GET_LOCK(?, 5)")) { s.setString(1,name); try(ResultSet r=s.executeQuery()){return r.next()&&r.getInt(1)==1;} } }
     private static void releaseBookingLock(Connection c, String name) { try (PreparedStatement s=c.prepareStatement("SELECT RELEASE_LOCK(?)")) { s.setString(1,name); s.execute(); } catch (SQLException ignored) { } }
     private static boolean secureCookie(HttpExchange e) { String forwarded=e.getRequestHeaders().getFirst("X-Forwarded-Proto"); return Boolean.parseBoolean(setting("COOKIE_SECURE", "false")) || (forwarded != null && forwarded.equalsIgnoreCase("https")); }

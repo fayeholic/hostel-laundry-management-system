@@ -45,6 +45,6 @@ async function adminReports(){const rows=await api('/api/admin/password-reset-re
 window.resetStudentPassword=async id=>{const password=$(`#temporary-${id}`).value;if(!password)return note('Enter a strong temporary password first.',true);try{const result=await api('/api/admin/reset-student-password',{method:'POST',body:new URLSearchParams({id,newPassword:password})});note('Password reset. Review and send the prepared WhatsApp message.');adminReports();if(result.whatsAppUrl)window.open(result.whatsAppUrl,'_blank','noopener')}catch(x){note(x.message,true)}};
 window.downloadReport=type=>{window.location=`/api/admin/export?type=${encodeURIComponent(type)}`};
 
-function enforcePhoneDigits(input){input.inputMode='numeric';input.setAttribute('pattern','[0-9]{8,20}');input.setCustomValidity(input.value&&!/^[0-9]{8,20}$/.test(input.value)?'Phone number must contain digits only (8 to 20 digits).':'')}
+function enforcePhoneDigits(input){input.inputMode='numeric';input.setAttribute('pattern','[0-9]{8,20}');input.setCustomValidity(input.value&&!/^[0-9]{8,20}$/.test(input.value)?'Phone number must contain numbers only.':'')}
 $$('[name="phone"]').forEach(enforcePhoneDigits);
 document.addEventListener('input',e=>{if(e.target?.name==='phone')enforcePhoneDigits(e.target)});

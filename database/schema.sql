@@ -75,12 +75,12 @@ CREATE TABLE IF NOT EXISTS password_reset_request (
 INSERT INTO machine (machine_name, hostel_block, status)
 SELECT 'Washing Machine 1', 'Block A', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 1');
 INSERT INTO machine (machine_name, hostel_block, status)
-SELECT 'Washing Machine 2', 'Block A', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 2');
+SELECT 'Washing Machine 2', 'Block A', 'IN_USE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 2');
 INSERT INTO machine (machine_name, hostel_block, status)
-SELECT 'Washing Machine 3', 'Block A', 'IN_USE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 3');
+SELECT 'Washing Machine 3', 'Block A', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 3');
 INSERT INTO machine (machine_name, hostel_block, status)
-SELECT 'Washing Machine 4', 'Block B', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 4');
+SELECT 'Dryer 1', 'Block A', 'MAINTENANCE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Dryer 1');
 INSERT INTO machine (machine_name, hostel_block, status)
-SELECT 'Washing Machine 5', 'Block B', 'MAINTENANCE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 5');
+SELECT 'Dryer 2', 'Block A', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Dryer 2');
 INSERT INTO machine (machine_name, hostel_block, status)
-SELECT 'Washing Machine 6', 'Block B', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Washing Machine 6');
+SELECT 'Dryer 3', 'Block A', 'AVAILABLE' WHERE NOT EXISTS (SELECT 1 FROM machine WHERE machine_name='Dryer 3');
